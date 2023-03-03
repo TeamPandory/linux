@@ -117,6 +117,15 @@ int laptop_mode;
 
 EXPORT_SYMBOL(laptop_mode);
 
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+/*
+ * Flag that enable/disable the big file writeback work.
+ */
+int limit_file_dirty;
+
+EXPORT_SYMBOL(limit_file_dirty);
+#endif
+
 /* End of sysctl-exported parameters */
 
 unsigned long global_dirty_limit;
@@ -188,6 +197,26 @@ static unsigned long writeout_period_time = 0;
  * global dirtyable memory first.
  */
 
+/**
+ * zone_dirtyable_memory - number of dirtyable pages in a zone
+ * @zone: the zone
+ *
+ * Returns the zone's number of pages potentially available for dirty
+ * page cache.  This is the base value for the per-zone dirty limits.
+ */
+static unsigned long zone_dirtyable_memory(struct zone *zone)
+{
+	unsigned long nr_pages;
+
+	nr_pages = zone_page_state(zone, NR_FREE_PAGES);
+	nr_pages -= min(nr_pages, zone->dirty_balance_reserve);
+
+	nr_pages += zone_page_state(zone, NR_INACTIVE_FILE);
+	nr_pages += zone_page_state(zone, NR_ACTIVE_FILE);
+
+	return nr_pages;
+}
+
 static unsigned long highmem_dirtyable_memory(unsigned long total)
 {
 #ifdef CONFIG_HIGHMEM
@@ -195,11 +224,9 @@ static unsigned long highmem_dirtyable_memory(unsigned long total)
 	unsigned long x = 0;
 
 	for_each_node_state(node, N_HIGH_MEMORY) {
-		struct zone *z =
-			&NODE_DATA(node)->node_zones[ZONE_HIGHMEM];
+		struct zone *z = &NODE_DATA(node)->node_zones[ZONE_HIGHMEM];
 
-		x += zone_page_state(z, NR_FREE_PAGES) +
-		     zone_reclaimable_pages(z) - z->dirty_balance_reserve;
+		x += zone_dirtyable_memory(z);
 	}
 	/*
 	 * Unreclaimable memory (kernel memory or anonymous memory
@@ -235,8 +262,11 @@ static unsigned long global_dirtyable_memory(void)
 {
 	unsigned long x;
 
-	x = global_page_state(NR_FREE_PAGES) + global_reclaimable_pages();
+	x = global_page_state(NR_FREE_PAGES);
 	x -= min(x, dirty_balance_reserve);
+
+	x += global_page_state(NR_INACTIVE_FILE);
+	x += global_page_state(NR_ACTIVE_FILE);
 
 	if (!vm_highmem_is_dirtyable)
 		x -= highmem_dirtyable_memory(x);
@@ -286,32 +316,6 @@ void global_dirty_limits(unsigned long *pbackground, unsigned long *pdirty)
 	*pbackground = background;
 	*pdirty = dirty;
 	trace_global_dirty_state(background, dirty);
-}
-
-/**
- * zone_dirtyable_memory - number of dirtyable pages in a zone
- * @zone: the zone
- *
- * Returns the zone's number of pages potentially available for dirty
- * page cache.  This is the base value for the per-zone dirty limits.
- */
-static unsigned long zone_dirtyable_memory(struct zone *zone)
-{
-	/*
-	 * The effective global number of dirtyable pages may exclude
-	 * highmem as a big-picture measure to keep the ratio between
-	 * dirty memory and lowmem reasonable.
-	 *
-	 * But this function is purely about the individual zone and a
-	 * highmem zone can hold its share of dirty pages, so we don't
-	 * care about vm_highmem_is_dirtyable here.
-	 */
-	unsigned long nr_pages = zone_page_state(zone, NR_FREE_PAGES) +
-		zone_reclaimable_pages(zone);
-
-	/* don't allow this to underflow */
-	nr_pages -= min(nr_pages, zone->dirty_balance_reserve);
-	return nr_pages;
 }
 
 /**
@@ -529,6 +533,61 @@ int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned max_ratio)
 	return ret;
 }
 EXPORT_SYMBOL(bdi_set_max_ratio);
+
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+int bdi_set_max_file_dirty(struct backing_dev_info *bdi,
+			   unsigned int max_file_dirty)
+{
+	int ret = 0;
+
+	spin_lock_bh(&bdi_lock);
+	if (bdi->writeback_batch * 2 > max_file_dirty) {
+		ret = -EINVAL;
+	} else
+		bdi->max_file_dirty = max_file_dirty;
+	spin_unlock_bh(&bdi_lock);
+
+	return ret;
+}
+
+int bdi_set_reimburse_centisecs(struct backing_dev_info *bdi,
+				unsigned int reimburse_time)
+{
+	int ret = 0;
+
+	spin_lock_bh(&bdi_lock);
+	if (reimburse_time > 400)
+		bdi->reimburse_time = 400;
+	else if (reimburse_time < 20)
+		bdi->reimburse_time = 20;
+	else
+		bdi->reimburse_time = reimburse_time;
+	spin_unlock_bh(&bdi_lock);
+
+	return ret;
+}
+
+int bdi_set_writeback_batch_shift(struct backing_dev_info *bdi,
+				  unsigned int writeback_batch_shift)
+{
+	int ret = 0;
+	unsigned int shift;
+
+	spin_lock_bh(&bdi_lock);
+	if (writeback_batch_shift < 8)
+		shift = 8;
+	else if (writeback_batch_shift > 10)
+		shift = 10;
+	else
+		shift = writeback_batch_shift;
+
+	bdi->writeback_batch = 1 << shift;
+	spin_unlock_bh(&bdi_lock);
+
+	return ret;
+}
+
+#endif
 
 static unsigned long dirty_freerun_ceiling(unsigned long thresh,
 					   unsigned long bg_thresh)
@@ -1104,11 +1163,11 @@ static unsigned long dirty_poll_interval(unsigned long dirty,
 	return 1;
 }
 
-static long bdi_max_pause(struct backing_dev_info *bdi,
-			  unsigned long bdi_dirty)
+static unsigned long bdi_max_pause(struct backing_dev_info *bdi,
+				   unsigned long bdi_dirty)
 {
-	long bw = bdi->avg_write_bandwidth;
-	long t;
+	unsigned long bw = bdi->avg_write_bandwidth;
+	unsigned long t;
 
 	/*
 	 * Limit pause time for small memory systems. If sleeping for too long
@@ -1120,7 +1179,7 @@ static long bdi_max_pause(struct backing_dev_info *bdi,
 	t = bdi_dirty / (1 + bw / roundup_pow_of_two(1 + HZ / 8));
 	t++;
 
-	return min_t(long, t, MAX_PAUSE);
+	return min_t(unsigned long, t, MAX_PAUSE);
 }
 
 static long bdi_min_pause(struct backing_dev_info *bdi,
@@ -1198,6 +1257,33 @@ static long bdi_min_pause(struct backing_dev_info *bdi,
 	return pages >= DIRTY_POLL_THRESH ? 1 + t / 2 : t;
 }
 
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+static long bdi_pause_for_filelimit(struct backing_dev_info *bdi,
+			  long max_pause)
+{
+	long hi = ilog2(bdi->avg_write_bandwidth);
+	long lo = ilog2(bdi->dirty_ratelimit);
+	long t;		/* target pause */
+
+	/* target for 10ms pause on 1-dd case */
+	t = max(1, HZ / 100);
+
+	/*
+	 * Scale up pause time for concurrent dirtiers in order to reduce CPU
+	 * overheads.
+	 *
+	 * (N * 10ms) on 2^N concurrent tasks.
+	 */
+	if (hi > lo)
+		t += (hi - lo) * (10 * HZ) / 1024;
+
+
+	t = min(t, 1 + max_pause / 2);
+
+	return t;
+}
+#endif
+
 /*
  * balance_dirty_pages() must be called by processes which are generating dirty
  * data.  It looks at the number of dirty pages in the machine and will force
@@ -1227,6 +1313,10 @@ static void balance_dirty_pages(struct address_space *mapping,
 	unsigned long pos_ratio;
 	struct backing_dev_info *bdi = mapping->backing_dev_info;
 	unsigned long start_time = jiffies;
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+	unsigned long file_limit;
+	unsigned long file_dirty;
+#endif
 
 	for (;;) {
 		unsigned long now = jiffies;
@@ -1250,17 +1340,33 @@ static void balance_dirty_pages(struct address_space *mapping,
 		 */
 		freerun = dirty_freerun_ceiling(dirty_thresh,
 						background_thresh);
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+		file_limit = bdi_file_limit(bdi);
+		file_limit = min(file_limit, dirty_thresh);
+		file_dirty = mapping->nrdirty + mapping->nrwriteback;
+		if (nr_dirty <= freerun &&
+			(limit_file_dirty == 0 ||
+			file_dirty < file_limit)) {
+#else
 		if (nr_dirty <= freerun) {
+#endif
 			current->dirty_paused_when = now;
 			current->nr_dirtied = 0;
 			current->nr_dirtied_pause =
 				dirty_poll_interval(nr_dirty, dirty_thresh);
 			break;
 		}
-
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+		if (unlikely(!writeback_in_progress(bdi))) {
+			if (nr_dirty > freerun ||
+					(limit_file_dirty &&
+					mapping->nrdirty > (file_limit >> 1)))
+				bdi_start_background_writeback(bdi);
+		}
+#else
 		if (unlikely(!writeback_in_progress(bdi)))
 			bdi_start_background_writeback(bdi);
-
+#endif
 		/*
 		 * bdi_thresh is not treated as some limiting factor as
 		 * dirty_thresh, due to reasons
@@ -1311,6 +1417,7 @@ static void balance_dirty_pages(struct address_space *mapping,
 					       bdi_thresh, bdi_dirty);
 		task_ratelimit = ((u64)dirty_ratelimit * pos_ratio) >>
 							RATELIMIT_CALC_SHIFT;
+
 		max_pause = bdi_max_pause(bdi, bdi_dirty);
 		min_pause = bdi_min_pause(bdi, max_pause,
 					  task_ratelimit, dirty_ratelimit,
@@ -1321,6 +1428,16 @@ static void balance_dirty_pages(struct address_space *mapping,
 			pause = max_pause;
 			goto pause;
 		}
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+		if (unlikely(limit_file_dirty &&
+			dirty_ratelimit < task_ratelimit &&
+			mapping->nrdirty + mapping->nrwriteback >= file_limit &&
+				mapping->nrdirty > (file_limit >> 3))) {
+			pause = bdi_pause_for_filelimit(bdi, max_pause);
+			period = pause;
+			goto pause;
+		}
+#endif
 		period = HZ * pages_dirtied / task_ratelimit;
 		pause = period;
 		if (current->dirty_paused_when)
@@ -1472,7 +1589,9 @@ void balance_dirty_pages_ratelimited(struct address_space *mapping)
 	struct backing_dev_info *bdi = mapping->backing_dev_info;
 	int ratelimit;
 	int *p;
-
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+	int file_dirty;
+#endif
 	if (!bdi_cap_account_dirty(bdi))
 		return;
 
@@ -1507,9 +1626,16 @@ void balance_dirty_pages_ratelimited(struct address_space *mapping)
 		current->nr_dirtied += nr_pages_dirtied;
 	}
 	preempt_enable();
-
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+	file_dirty = mapping->nrdirty + mapping->nrwriteback;
+	if (unlikely(current->nr_dirtied >= ratelimit ||
+			(limit_file_dirty &&
+			file_dirty >= bdi_file_limit(bdi))))
+		balance_dirty_pages(mapping, current->nr_dirtied);
+#else
 	if (unlikely(current->nr_dirtied >= ratelimit))
 		balance_dirty_pages(mapping, current->nr_dirtied);
+#endif
 }
 EXPORT_SYMBOL(balance_dirty_pages_ratelimited);
 
@@ -1995,6 +2121,9 @@ void account_page_dirtied(struct page *page, struct address_space *mapping)
 		__inc_bdi_stat(mapping->backing_dev_info, BDI_DIRTIED);
 		task_io_account_write(PAGE_CACHE_SIZE);
 		current->nr_dirtied++;
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+		mapping->nrdirty++;
+#endif
 		this_cpu_inc(bdp_ratelimits);
 	}
 }
@@ -2031,11 +2160,12 @@ int __set_page_dirty_nobuffers(struct page *page)
 	if (!TestSetPageDirty(page)) {
 		struct address_space *mapping = page_mapping(page);
 		struct address_space *mapping2;
+		unsigned long flags;
 
 		if (!mapping)
 			return 1;
 
-		spin_lock_irq(&mapping->tree_lock);
+		spin_lock_irqsave(&mapping->tree_lock, flags);
 		mapping2 = page_mapping(page);
 		if (mapping2) { /* Race with truncate? */
 			BUG_ON(mapping2 != mapping);
@@ -2044,7 +2174,7 @@ int __set_page_dirty_nobuffers(struct page *page)
 			radix_tree_tag_set(&mapping->page_tree,
 				page_index(page), PAGECACHE_TAG_DIRTY);
 		}
-		spin_unlock_irq(&mapping->tree_lock);
+		spin_unlock_irqrestore(&mapping->tree_lock, flags);
 		if (mapping->host) {
 			/* !PageAnon && !swapper_space */
 			__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
@@ -2208,9 +2338,18 @@ int clear_page_dirty_for_io(struct page *page)
 		 * for more comments.
 		 */
 		if (TestClearPageDirty(page)) {
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+			unsigned long flags;
+#endif
 			dec_zone_page_state(page, NR_FILE_DIRTY);
 			dec_bdi_stat(mapping->backing_dev_info,
 					BDI_RECLAIMABLE);
+
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+			spin_lock_irqsave(&mapping->tree_lock, flags);
+			mapping->nrdirty--;
+			spin_unlock_irqrestore(&mapping->tree_lock, flags);
+#endif
 			return 1;
 		}
 		return 0;
@@ -2238,6 +2377,9 @@ int test_clear_page_writeback(struct page *page)
 				__dec_bdi_stat(bdi, BDI_WRITEBACK);
 				__bdi_writeout_inc(bdi);
 			}
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+			mapping->nrwriteback--;
+#endif
 		}
 		spin_unlock_irqrestore(&mapping->tree_lock, flags);
 	} else {
@@ -2267,6 +2409,9 @@ int test_set_page_writeback(struct page *page)
 						PAGECACHE_TAG_WRITEBACK);
 			if (bdi_cap_account_writeback(bdi))
 				__inc_bdi_stat(bdi, BDI_WRITEBACK);
+#ifdef CONFIG_FILE_DIRTY_LIMIT
+			mapping->nrwriteback++;
+#endif
 		}
 		if (!PageDirty(page))
 			radix_tree_tag_clear(&mapping->page_tree,

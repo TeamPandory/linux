@@ -1,9 +1,22 @@
 /*
+ * linux-3.10/drivers/pci/msi.c
+ *
  * File:	msi.c
  * Purpose:	PCI Message Signaled Interrupt (MSI)
  *
  * Copyright (C) 2003-2004 Intel
  * Copyright (C) Tom Long Nguyen (tom.l.nguyen@intel.com)
+ * Copyright (c) 2007-2017 Allwinnertech Co., Ltd.
+ *
+ * This software is licensed under the terms of the GNU General Public
+ * License version 2, as published by the Free Software Foundation, and
+ * may be copied, distributed, and modified under those terms.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
  */
 
 #include <linux/err.h>
@@ -30,20 +43,44 @@ static int pci_msi_enable = 1;
 
 /* Arch hooks */
 
-#ifndef arch_msi_check_device
-int arch_msi_check_device(struct pci_dev *dev, int nvec, int type)
+int __weak arch_setup_msi_irq(struct pci_dev *dev, struct msi_desc *desc)
 {
+	struct msi_chip *chip = dev->bus->msi;
+	int err;
+
+	if (!chip || !chip->setup_irq)
+		return -EINVAL;
+
+	err = chip->setup_irq(chip, dev, desc);
+	if (err < 0)
+		return err;
+
+	irq_set_chip_data(desc->irq, chip);
+
 	return 0;
 }
-#endif
 
-#ifndef arch_setup_msi_irqs
-# define arch_setup_msi_irqs default_setup_msi_irqs
-# define HAVE_DEFAULT_MSI_SETUP_IRQS
-#endif
+void __weak arch_teardown_msi_irq(unsigned int irq)
+{
+	struct msi_chip *chip = irq_get_chip_data(irq);
 
-#ifdef HAVE_DEFAULT_MSI_SETUP_IRQS
-int default_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+	if (!chip || !chip->teardown_irq)
+		return;
+
+	chip->teardown_irq(chip, irq);
+}
+
+int __weak arch_msi_check_device(struct pci_dev *dev, int nvec, int type)
+{
+	struct msi_chip *chip = dev->bus->msi;
+
+	if (!chip || !chip->check_device)
+		return 0;
+
+	return chip->check_device(chip, dev, nvec, type);
+}
+
+int __weak arch_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
 {
 	struct msi_desc *entry;
 	int ret;
@@ -65,14 +102,11 @@ int default_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
 
 	return 0;
 }
-#endif
 
-#ifndef arch_teardown_msi_irqs
-# define arch_teardown_msi_irqs default_teardown_msi_irqs
-# define HAVE_DEFAULT_MSI_TEARDOWN_IRQS
-#endif
-
-#ifdef HAVE_DEFAULT_MSI_TEARDOWN_IRQS
+/*
+ * We have a default implementation available as a separate non-weak
+ * function, as it is used by the Xen x86 PCI code
+ */
 void default_teardown_msi_irqs(struct pci_dev *dev)
 {
 	struct msi_desc *entry;
@@ -82,18 +116,19 @@ void default_teardown_msi_irqs(struct pci_dev *dev)
 		if (entry->irq == 0)
 			continue;
 		nvec = 1 << entry->msi_attrib.multiple;
-		for (i = 0; i < nvec; i++)
+		for (i = 0; i < nvec; i++) {
+			if (entry->irq == 0)
+				break;
 			arch_teardown_msi_irq(entry->irq + i);
+		}
 	}
 }
-#endif
 
-#ifndef arch_restore_msi_irqs
-# define arch_restore_msi_irqs default_restore_msi_irqs
-# define HAVE_DEFAULT_MSI_RESTORE_IRQS
-#endif
+void __weak arch_teardown_msi_irqs(struct pci_dev *dev)
+{
+	return default_teardown_msi_irqs(dev);
+}
 
-#ifdef HAVE_DEFAULT_MSI_RESTORE_IRQS
 void default_restore_msi_irqs(struct pci_dev *dev, int irq)
 {
 	struct msi_desc *entry;
@@ -111,7 +146,11 @@ void default_restore_msi_irqs(struct pci_dev *dev, int irq)
 	if (entry)
 		write_msi_msg(irq, &entry->msg);
 }
-#endif
+
+void __weak arch_restore_msi_irqs(struct pci_dev *dev, int irq)
+{
+	return default_restore_msi_irqs(dev, irq);
+}
 
 static void msi_set_enable(struct pci_dev *dev, int enable)
 {
@@ -203,8 +242,6 @@ static void msix_mask_irq(struct msi_desc *desc, u32 flag)
 	desc->masked = __msix_mask_irq(desc, flag);
 }
 
-#ifdef CONFIG_GENERIC_HARDIRQS
-
 static void msi_set_mask_bit(struct irq_data *data, u32 flag)
 {
 	struct msi_desc *desc = irq_data_get_msi(data);
@@ -227,8 +264,6 @@ void unmask_msi_irq(struct irq_data *data)
 {
 	msi_set_mask_bit(data, 0);
 }
-
-#endif /* CONFIG_GENERIC_HARDIRQS */
 
 void __read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 {
@@ -337,10 +372,8 @@ static void free_msi_irqs(struct pci_dev *dev)
 		if (!entry->irq)
 			continue;
 		nvec = 1 << entry->msi_attrib.multiple;
-#ifdef CONFIG_GENERIC_HARDIRQS
 		for (i = 0; i < nvec; i++)
 			BUG_ON(irq_has_action(entry->irq + i));
-#endif
 	}
 
 	arch_teardown_msi_irqs(dev);
@@ -530,6 +563,20 @@ out_unroll:
 	return ret;
 }
 
+static int msi_verify_entries(struct pci_dev *dev)
+{
+	struct msi_desc *entry;
+
+	list_for_each_entry(entry, &dev->msi_list, list) {
+		if (!dev->no_64bit_msi || !entry->msg.address_hi)
+			continue;
+		dev_err(&dev->dev, "Device has broken 64-bit MSI but arch"
+			" tried to assign one above 4G\n");
+		return -EIO;
+	}
+	return 0;
+}
+
 /**
  * msi_capability_init - configure device's MSI capability structure
  * @dev: pointer to the pci_dev data structure of MSI device function
@@ -577,6 +624,13 @@ static int msi_capability_init(struct pci_dev *dev, int nvec)
 
 	/* Configure MSI capability structure */
 	ret = arch_setup_msi_irqs(dev, nvec, PCI_CAP_ID_MSI);
+	if (ret) {
+		msi_mask_irq(entry, mask, ~mask);
+		free_msi_irqs(dev);
+		return ret;
+	}
+
+	ret = msi_verify_entries(dev);
 	if (ret) {
 		msi_mask_irq(entry, mask, ~mask);
 		free_msi_irqs(dev);
@@ -695,6 +749,11 @@ static int msix_capability_init(struct pci_dev *dev,
 		return ret;
 
 	ret = arch_setup_msi_irqs(dev, nvec, PCI_CAP_ID_MSIX);
+	if (ret)
+		goto error;
+
+	/* Check if all MSI entries honor device restrictions */
+	ret = msi_verify_entries(dev);
 	if (ret)
 		goto error;
 

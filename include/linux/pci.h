@@ -12,6 +12,16 @@
  *	PCI Local Bus Specification
  *	PCI to PCI Bridge Specification
  *	PCI System Design Guide
+ *
+ * This software is licensed under the terms of the GNU General Public
+ * License version 2, as published by the Free Software Foundation, and
+ * may be copied, distributed, and modified under those terms.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
  */
 #ifndef LINUX_PCI_H
 #define LINUX_PCI_H
@@ -310,6 +320,7 @@ struct pci_dev {
 	unsigned int	is_added:1;
 	unsigned int	is_busmaster:1; /* device is busmaster */
 	unsigned int	no_msi:1;	/* device may not use msi */
+	unsigned int	no_64bit_msi:1; /* device may only use 32-bit MSIs */
 	unsigned int	block_cfg_access:1;	/* config space access is blocked */
 	unsigned int	broken_parity_status:1;	/* Device generates false positive parity */
 	unsigned int	irq_reroute_variant:2;	/* device needs IRQ rerouting variant */
@@ -432,6 +443,7 @@ struct pci_bus {
 	struct resource busn_res;	/* bus numbers routed to this bus */
 
 	struct pci_ops	*ops;		/* configuration access functions */
+	struct msi_chip	*msi;		/* MSI controller */
 	void		*sysdata;	/* hook for sys-specific extension */
 	struct proc_dir_entry *procdir;	/* directory entry in /proc/bus/pci */
 
@@ -835,6 +847,19 @@ static inline int pci_write_config_dword(const struct pci_dev *dev, int where,
 {
 	return pci_bus_write_config_dword(dev->bus, dev->devfn, where, val);
 }
+
+#ifdef CONFIG_ARCH_SUN50IW6
+struct pci_page {
+	unsigned long offset;
+	void __iomem *mem_base;
+};
+
+struct pci_page sunxi_pcie_bus_cutpage_config(struct pci_dev *dev, int barnum, u32 bar_base, unsigned long offset);
+struct pci_page sunxi_pcie_device_cutpage_config(u32 bar_base, unsigned long offset);
+int sunxi_pcie_cutpage_base(u32 bar_base);
+unsigned long sunxi_pcie_cutpage_spin_lock(void);
+void sunxi_pcie_cutpage_spin_unlock(unsigned long flags);
+#endif
 
 int pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val);
 int pcie_capability_read_dword(struct pci_dev *dev, int pos, u32 *val);

@@ -324,10 +324,7 @@ static void crypto_wait_for_test(struct crypto_larval *larval)
 			goto out;
 		crypto_alg_tested(larval->alg.cra_driver_name, 0);
 	}
-
 	err = wait_for_completion_interruptible(&larval->completion);
-	WARN_ON(err);
-
 out:
 	crypto_larval_kill(&larval->alg);
 }
@@ -495,7 +492,8 @@ static struct crypto_template *__crypto_lookup_template(const char *name)
 
 struct crypto_template *crypto_lookup_template(const char *name)
 {
-	return try_then_request_module(__crypto_lookup_template(name), name);
+	return try_then_request_module(__crypto_lookup_template(name), "%s",
+				       name);
 }
 EXPORT_SYMBOL_GPL(crypto_lookup_template);
 

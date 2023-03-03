@@ -34,10 +34,16 @@
 #include <linux/device_cgroup.h>
 #include <linux/fs_struct.h>
 #include <linux/posix_acl.h>
+#include <linux/hash.h>
 #include <asm/uaccess.h>
+
+#include <linux/fivm.h>
 
 #include "internal.h"
 #include "mount.h"
+#ifdef CONFIG_MSDCARD_FS
+#include "msdcardfs/sdcardfs.h"
+#endif
 
 /* [Feb-1997 T. Schoebel-Theuer]
  * Fundamental changes in the pathname lookup mechanisms (namei)
@@ -321,10 +327,11 @@ int generic_permission(struct inode *inode, int mask)
 
 	if (S_ISDIR(inode->i_mode)) {
 		/* DACs are overridable for directories */
-		if (inode_capable(inode, CAP_DAC_OVERRIDE))
+		if (capable_wrt_inode_uidgid(inode, CAP_DAC_OVERRIDE))
 			return 0;
 		if (!(mask & MAY_WRITE))
-			if (inode_capable(inode, CAP_DAC_READ_SEARCH))
+			if (capable_wrt_inode_uidgid(inode,
+						     CAP_DAC_READ_SEARCH))
 				return 0;
 		return -EACCES;
 	}
@@ -334,7 +341,7 @@ int generic_permission(struct inode *inode, int mask)
 	 * at least one exec bit set.
 	 */
 	if (!(mask & MAY_EXEC) || (inode->i_mode & S_IXUGO))
-		if (inode_capable(inode, CAP_DAC_OVERRIDE))
+		if (capable_wrt_inode_uidgid(inode, CAP_DAC_OVERRIDE))
 			return 0;
 
 	/*
@@ -342,7 +349,7 @@ int generic_permission(struct inode *inode, int mask)
 	 */
 	mask &= MAY_READ | MAY_WRITE | MAY_EXEC;
 	if (mask == MAY_READ)
-		if (inode_capable(inode, CAP_DAC_READ_SEARCH))
+		if (capable_wrt_inode_uidgid(inode, CAP_DAC_READ_SEARCH))
 			return 0;
 
 	return -EACCES;
@@ -1646,8 +1653,7 @@ static inline int can_lookup(struct inode *inode)
 
 static inline unsigned int fold_hash(unsigned long hash)
 {
-	hash += hash >> (8*sizeof(int));
-	return hash;
+	return hash_64(hash, 32);
 }
 
 #else	/* 32-bit case */
@@ -2199,7 +2205,7 @@ static inline int check_sticky(struct inode *dir, struct inode *inode)
 		return 0;
 	if (uid_eq(dir->i_uid, fsuid))
 		return 0;
-	return !inode_capable(inode, CAP_FOWNER);
+	return !capable_wrt_inode_uidgid(inode, CAP_FOWNER);
 }
 
 /*
@@ -2263,6 +2269,7 @@ static int may_delete(struct inode *dir,struct dentry *victim,int isdir)
  */
 static inline int may_create(struct inode *dir, struct dentry *child)
 {
+	audit_inode_child(dir, child, AUDIT_TYPE_CHILD_CREATE);
 	if (child->d_inode)
 		return -EEXIST;
 	if (IS_DEADDIR(dir))
@@ -2882,6 +2889,12 @@ opened:
 	if (error)
 		goto exit_fput;
 
+#ifdef CONFIG_FILE_INTEGRITY
+	error = fivm_open_verify(file, name->name, op->acc_mode);
+	if (error)
+		goto exit_fput;
+#endif
+
 	if (will_truncate) {
 		error = handle_truncate(file);
 		if (error)
@@ -3422,7 +3435,11 @@ int vfs_unlink(struct inode *dir, struct dentry *dentry)
  * writeout happening, and we don't want to prevent access to the directory
  * while waiting on the I/O.
  */
+#ifdef CONFIG_MSDCARD_FS
+long do_unlinkat(int dfd, const char __user *pathname, bool propagate)
+#else
 static long do_unlinkat(int dfd, const char __user *pathname)
+#endif
 {
 	int error;
 	struct filename *name;
@@ -3430,6 +3447,11 @@ static long do_unlinkat(int dfd, const char __user *pathname)
 	struct nameidata nd;
 	struct inode *inode = NULL;
 	unsigned int lookup_flags = 0;
+#ifdef CONFIG_MSDCARD_FS
+	/* temp code to avoid issue */
+	char *path_buf = NULL;
+	char *propagate_path = NULL;
+#endif
 retry:
 	name = user_path_parent(dfd, pathname, &nd, lookup_flags);
 	if (IS_ERR(name))
@@ -3454,6 +3476,20 @@ retry:
 		inode = dentry->d_inode;
 		if (!inode)
 			goto slashes;
+#ifdef CONFIG_MSDCARD_FS
+		/* temp code to avoid issue */
+		if (inode->i_sb->s_op->unlink_callback && propagate) {
+			struct inode *lower_inode = inode;
+			while (lower_inode->i_op->get_lower_inode) {
+				if (inode->i_sb->s_magic == SDCARDFS_SUPER_MAGIC
+						&& SDCARDFS_SB(inode->i_sb)->options.label) {
+					path_buf = kmalloc(PATH_MAX, GFP_KERNEL);
+					propagate_path = dentry_path_raw(dentry, path_buf, PATH_MAX);
+				}
+				lower_inode = lower_inode->i_op->get_lower_inode(lower_inode);
+			}
+		}
+#endif
 		ihold(inode);
 		error = security_path_unlink(&nd.path, dentry);
 		if (error)
@@ -3463,6 +3499,13 @@ exit2:
 		dput(dentry);
 	}
 	mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
+#ifdef CONFIG_MSDCARD_FS
+	/* temp code to avoid issue */
+	if (path_buf && !IS_ERR(path_buf) && !error && propagate) {
+		inode->i_sb->s_op->unlink_callback(inode, propagate_path);
+		kfree(path_buf);
+	}
+#endif
 	if (inode)
 		iput(inode);	/* truncate the inode here */
 	mnt_drop_write(nd.path.mnt);
@@ -3490,12 +3533,20 @@ SYSCALL_DEFINE3(unlinkat, int, dfd, const char __user *, pathname, int, flag)
 	if (flag & AT_REMOVEDIR)
 		return do_rmdir(dfd, pathname);
 
+#ifdef CONFIG_MSDCARD_FS
+	return do_unlinkat(dfd, pathname, true);
+#else
 	return do_unlinkat(dfd, pathname);
+#endif
 }
 
 SYSCALL_DEFINE1(unlink, const char __user *, pathname)
 {
+#ifdef CONFIG_MSDCARD_FS
+	return do_unlinkat(AT_FDCWD, pathname, true);
+#else
 	return do_unlinkat(AT_FDCWD, pathname);
+#endif
 }
 
 int vfs_symlink(struct inode *dir, struct dentry *dentry, const char *oldname)
@@ -3654,6 +3705,7 @@ retry:
 out_dput:
 	done_path_create(&new_path, new_dentry);
 	if (retry_estale(error, how)) {
+		path_put(&old_path);
 		how |= LOOKUP_REVAL;
 		goto retry;
 	}

@@ -591,11 +591,16 @@ static int ehci_run (struct usb_hcd *hcd)
 	 */
 	hcc_params = ehci_readl(ehci, &ehci->caps->hcc_params);
 	if (HCC_64BIT_ADDR(hcc_params)) {
-		ehci_writel(ehci, 0, &ehci->regs->segment);
-#if 0
-// this is deeply broken on almost all architectures
+#ifdef CONFIG_ARM64
+		ehci_writel(ehci, ehci->periodic_dma >> 32, &ehci->regs->segment);
+		/*
+		 * this is deeply broken on almost all architectures
+		 * but arm64 can use it so enable it
+		 */
 		if (!dma_set_mask(hcd->self.controller, DMA_BIT_MASK(64)))
 			ehci_info(ehci, "enabled 64bit DMA\n");
+#else
+		ehci_writel(ehci, 0, &ehci->regs->segment);
 #endif
 	}
 
@@ -686,8 +691,15 @@ static irqreturn_t ehci_irq (struct usb_hcd *hcd)
 	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
 	u32			status, masked_status, pcd_status = 0, cmd;
 	int			bh;
+	unsigned long		flags;
 
-	spin_lock (&ehci->lock);
+	/*
+	 * For threadirqs option we use spin_lock_irqsave() variant to prevent
+	 * deadlock with ehci hrtimer callback, because hrtimer callbacks run
+	 * in interrupt context even when threadirqs is specified. We can go
+	 * back to spin_lock() variant when hrtimer callbacks become threaded.
+	 */
+	spin_lock_irqsave(&ehci->lock, flags);
 
 	status = ehci_readl(ehci, &ehci->regs->status);
 
@@ -705,7 +717,7 @@ static irqreturn_t ehci_irq (struct usb_hcd *hcd)
 
 	/* Shared IRQ? */
 	if (!masked_status || unlikely(ehci->rh_state == EHCI_RH_HALTED)) {
-		spin_unlock(&ehci->lock);
+		spin_unlock_irqrestore(&ehci->lock, flags);
 		return IRQ_NONE;
 	}
 
@@ -758,6 +770,16 @@ static irqreturn_t ehci_irq (struct usb_hcd *hcd)
 	if (status & STS_PCD) {
 		unsigned	i = HCS_N_PORTS (ehci->hcs_params);
 		u32		ppcd = ~0;
+{
+		int pstatus0 = 0;
+		pstatus0 = ehci_readl(ehci, &ehci->regs->port_status[0]);
+
+		if((pstatus0 & PORT_CONNECT) && (pstatus0 & PORT_CSC)){
+			printk("ehci_irq: highspeed device connect\n");
+		}else if(!(pstatus0 & PORT_CONNECT) && (pstatus0 & PORT_CSC)){
+			printk("ehci_irq: highspeed device disconnect\n");
+		}
+}
 
 		/* kick root hub later */
 		pcd_status = status;
@@ -823,7 +845,7 @@ dead:
 
 	if (bh)
 		ehci_work (ehci);
-	spin_unlock (&ehci->lock);
+	spin_unlock_irqrestore(&ehci->lock, flags);
 	if (pcd_status)
 		usb_hcd_poll_rh_status(hcd);
 	return IRQ_HANDLED;
@@ -965,8 +987,6 @@ rescan:
 	}
 
 	qh->exception = 1;
-	if (ehci->rh_state < EHCI_RH_RUNNING)
-		qh->qh_state = QH_STATE_IDLE;
 	switch (qh->qh_state) {
 	case QH_STATE_LINKED:
 	case QH_STATE_COMPLETING:
@@ -1284,6 +1304,11 @@ MODULE_LICENSE ("GPL");
 #ifdef CONFIG_MIPS_SEAD3
 #include "ehci-sead3.c"
 #define	PLATFORM_DRIVER		ehci_hcd_sead3_driver
+#endif
+
+#ifdef CONFIG_USB_SUNXI_HCI
+#include "ehci_sunxi.c"
+#define	PLATFORM_DRIVER		sunxi_ehci_hcd_driver
 #endif
 
 static int __init ehci_hcd_init(void)

@@ -333,6 +333,7 @@ config NET_DMA
 	bool "Network: TCP receive copy offload"
 	depends on DMA_ENGINE && NET
 	default (INTEL_IOATDMA || FSL_DMA)
+	depends on BROKEN
 	help
 	  This enables the use of DMA engines in the network stack to
 	  offload receive copy-to-user operations, freeing CPU cycles.
@@ -350,6 +351,33 @@ config ASYNC_TX_DMA
 	  MD_RAID456 say Y.
 
 	  If unsure, say N.
+
+config SUNXI_DMA
+	tristate "Sunxi SOC DMA support"
+	depends on ARCH_SUNXI
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	help
+	  Support the DMA engine found on Sunxi family SOCs.
+	  This DMA engine can only be used with on-chip devices.
+
+config SUN3I_DMA
+	tristate "Sun3i SOC DMA support"
+	depends on ARCH_SUN3I
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	help
+	  Support the DMA engine of Sun3i on Sunxi family SOCs.
+	  This DMA engine can only be used with on-chip devices.
+
+config SUNXI_RDMA
+	tristate "Sunxi SOC R_DMA support"
+	depends on ARCH_SUN9I
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	help
+	  Support the DMA engine found on Sunxi family SOCs.
+	  This DMA engine can only be used with on-chip devices.
 
 config DMATEST
 	tristate "DMA Test client"

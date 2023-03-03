@@ -663,7 +663,9 @@ void wiphy_rfkill_start_polling(struct wiphy *wiphy)
 	if (!rdev->ops->rfkill_poll)
 		return;
 	rdev->rfkill_ops.poll = cfg80211_rfkill_poll;
+#ifdef CONFIG_PM
 	rfkill_resume_polling(rdev->rfkill);
+#endif
 }
 EXPORT_SYMBOL(wiphy_rfkill_start_polling);
 
@@ -876,6 +878,7 @@ void cfg80211_leave(struct cfg80211_registered_device *rdev,
 		cfg80211_leave_mesh(rdev, dev);
 		break;
 	case NL80211_IFTYPE_AP:
+	case NL80211_IFTYPE_P2P_GO:
 		cfg80211_stop_ap(rdev, dev);
 		break;
 	default:
